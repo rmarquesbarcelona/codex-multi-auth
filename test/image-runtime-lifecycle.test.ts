@@ -61,12 +61,12 @@ async function startProxy(fetchImpl: typeof fetch): Promise<RuntimeRotationProxy
 	return proxy;
 }
 
-function postImage(
+function postJson(
 	proxy: RuntimeRotationProxyServer,
-	prompt: string,
+	path: string,
+	body: string,
 ): { response: Promise<{ status: number; body: string }>; destroy: () => void } {
-	const url = new URL(`${proxy.baseUrl}/images/generations`);
-	const body = JSON.stringify({ model: "gpt-image-2", prompt });
+	const url = new URL(`${proxy.baseUrl}${path}`);
 	let clientRequest: ReturnType<typeof request>;
 	const response = new Promise<{ status: number; body: string }>((resolve, reject) => {
 		clientRequest = request(
@@ -105,6 +105,27 @@ function postImage(
 	};
 }
 
+function postImage(
+	proxy: RuntimeRotationProxyServer,
+	prompt: string,
+): { response: Promise<{ status: number; body: string }>; destroy: () => void } {
+	return postJson(
+		proxy,
+		"/images/generations",
+		JSON.stringify({ model: "gpt-image-2", prompt }),
+	);
+}
+
+function postResponses(
+	proxy: RuntimeRotationProxyServer,
+): { response: Promise<{ status: number; body: string }>; destroy: () => void } {
+	return postJson(
+		proxy,
+		"/responses",
+		JSON.stringify({ input: "disconnect", stream: false }),
+	);
+}
+
 beforeEach(() => {
 	resetTrackers();
 	clearCircuitBreakers();
@@ -120,6 +141,7 @@ beforeEach(() => {
 
 afterEach(async () => {
 	vi.useRealTimers();
+	vi.restoreAllMocks();
 	for (const proxy of openServers.splice(0, openServers.length)) {
 		await proxy.close();
 	}
@@ -168,6 +190,104 @@ describe("image request lifecycle", () => {
 		await new Promise<void>((resolve) => setImmediate(resolve));
 
 		expect(fetchImpl).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps disconnect cancellation active after headers until streaming takes over", async () => {
+		let fetchSignal: AbortSignal | undefined;
+		const fetchImpl: typeof fetch = vi.fn(async (_input, init) => {
+			fetchSignal = init?.signal ?? undefined;
+			return new Response(null, {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const proxy = await startProxy(fetchImpl);
+		const manager = openManagers.at(-1);
+		expect(manager).toBeDefined();
+
+		let markPersistStarted: (() => void) | undefined;
+		const persistStarted = new Promise<void>((resolve) => {
+			markPersistStarted = resolve;
+		});
+		let releasePersist: (() => void) | undefined;
+		const persistRelease = new Promise<void>((resolve) => {
+			releasePersist = resolve;
+		});
+		vi.spyOn(manager!, "syncCodexCliActiveSelectionForIndex").mockImplementation(
+			async () => {
+				markPersistStarted?.();
+				await persistRelease;
+			},
+		);
+
+		const client = postImage(proxy, "handoff");
+		void client.response.catch(() => undefined);
+		await persistStarted;
+		expect(fetchSignal?.aborted).toBe(false);
+
+		client.destroy();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(fetchSignal?.aborted).toBe(true);
+
+		releasePersist?.();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not abort or cool a responses request when the client disconnects before headers", async () => {
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		let settleUpstream: ((response: Response) => void) | undefined;
+		let abortCount = 0;
+		const fetchImpl: typeof fetch = vi.fn(async (_input, init) => {
+			markStarted?.();
+			return await new Promise<Response>((resolve, reject) => {
+				settleUpstream = resolve;
+				const signal = init?.signal;
+				if (!signal) {
+					reject(new Error("expected fetch abort signal"));
+					return;
+				}
+				const onAbort = () => {
+					abortCount += 1;
+					reject(new DOMException("aborted", "AbortError"));
+				};
+				if (signal.aborted) onAbort();
+				else signal.addEventListener("abort", onAbort, { once: true });
+			});
+		});
+		const proxy = await startProxy(fetchImpl);
+		const manager = openManagers.at(-1);
+		expect(manager).toBeDefined();
+		const client = postResponses(proxy);
+		void client.response.catch(() => undefined);
+
+		await started;
+		client.destroy();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		expect(abortCount).toBe(0);
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		const account = manager!.getAccountByIndex(0);
+		expect(account).toBeDefined();
+		expect(
+			manager!.getManagedAccountRuntimeSkipReason(account!, "codex", null),
+		).toBeNull();
+
+		settleUpstream?.(
+			new Response(null, {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(abortCount).toBe(0);
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		expect(
+			manager!.getManagedAccountRuntimeSkipReason(account!, "codex", null),
+		).toBeNull();
 	});
 
 	it("keeps the image fetch pending through 299999 ms and returns one 502 at 300000 ms", async () => {
